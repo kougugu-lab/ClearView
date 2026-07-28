@@ -161,6 +161,7 @@ class SettingsDialog(tk.Toplevel):
         self._tune_status_var = tk.StringVar(value="プレビューを開始して調整エリアを指定してください")
         # GPIO関連
         self.v_trigger_pin = tk.StringVar(value=str(self.temp_data["gpio"].get("trigger_pin", 22)))
+        self.v_trigger_pull_up = tk.BooleanVar(value=bool(self.temp_data["gpio"].get("trigger_pull_up", True)))
         self.v_system_running_pin = tk.StringVar(value=str(self.temp_data["gpio"].get("system_running_pin", 5)))
         self.v_output_ok_pin = tk.StringVar(value=str(self.temp_data["gpio"].get("output_ok_pin", 16)))
         self.v_output_ng_pin = tk.StringVar(value=str(self.temp_data["gpio"].get("output_ng_pin", 20)))
@@ -572,7 +573,7 @@ class SettingsDialog(tk.Toplevel):
         col_right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5)
 
         # 1. 左カラム: ピン番号入力
-        outer_p, inner_p = create_card(col_left, "GPIOピン定義 (BCM番号)")
+        outer_p, inner_p = create_card(col_left, "GPIOピン定義")
         outer_p.pack(fill=tk.X, pady=(0, 10))
 
         # フォーカス監視用のフックを仕込んだ行生成関数
@@ -595,11 +596,25 @@ class SettingsDialog(tk.Toplevel):
         _make_pin_row(inner_p, "OK出力:", self.v_output_ok_pin, "撮影が正常に完了したことを外部に伝える出力ピンです。")
         _make_pin_row(inner_p, "NG出力:", self.v_output_ng_pin, "カメラエラーなどの撮影異常が発生した際の出力ピンです。")
 
+        # 1.5 左カラム下部: 入力信号状態表示 (LEDインジケータ)
+        outer_in, inner_in = create_card(col_left, "トリガー入力 信号状態")
+        outer_in.pack(fill=tk.X, pady=10)
+
+        r_test = tk.Frame(inner_in, bg=COLOR_BG_PANEL)
+        r_test.pack(fill=tk.X, pady=4)
+        tk.Label(r_test, text="リアルタイム信号状態:", font=FONT_SET_VAL, bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN).pack(side=tk.LEFT)
+
+        # LEDインジケータ (Canvas)
+        self.trig_led = tk.Canvas(r_test, width=22, height=22, bg=COLOR_BG_PANEL, highlightthickness=0)
+        self.trig_led.pack(side=tk.LEFT, padx=10)
+        self.trig_circle = self.trig_led.create_oval(2, 2, 20, 20, fill="#333333", outline="#555555")
+        Tooltip(self.trig_led, "トリガーピン(BCM)の入力信号状態。Active(ON)のとき緑色に点灯します。")
+
         # 2. 中カラム: Raspberry Pi 40Pin Map
         self.show_gpio_map(col_mid)
 
-        # 3. 右カラム: パルス出力時間とテスト出力
-        outer_t, inner_t = create_card(col_right, "パルス時間と出力テスト")
+        # 3. 右カラム: パルス時間と出力テスト点灯
+        outer_t, inner_t = create_card(col_right, "パルス時間と出力テスト点灯")
         outer_t.pack(fill=tk.X, pady=(0, 10))
 
         def _make_duration_row(parent, label, var, tip):
@@ -614,34 +629,79 @@ class SettingsDialog(tk.Toplevel):
         _make_duration_row(inner_t, "OK出力時間 (秒):", self.v_output_ok_duration, "OK出力信号をONにし続ける時間です。")
         _make_duration_row(inner_t, "NG出力時間 (秒):", self.v_output_ng_duration, "NG出力信号をONにし続ける時間です。")
 
-        # 模擬出力テストボタン
-        tk.Label(inner_t, text="▼ GPIO手動テスト (システム停止中のみ機能)", font=FONT_SET_LBL, bg=COLOR_BG_PANEL, fg=COLOR_ACCENT).pack(anchor="w", pady=(15, 5))
-        
-        btn_grid = tk.Frame(inner_t, bg=COLOR_BG_PANEL)
-        btn_grid.pack(fill=tk.X, pady=5)
+        # 模擬出力テスト点灯 (inspection_app 準拠)
+        tk.Label(inner_t, text="▼ GPIO出力テスト点灯 (トグル切替)", font=FONT_SET_LBL, bg=COLOR_BG_PANEL, fg=COLOR_ACCENT).pack(anchor="w", pady=(15, 5))
 
-        def _trigger_test_pulse(pin_var, duration_var):
-            # GPIOのOK/NGのテストパルスを送る (ハードウェアがある場合のみ)
-            # app_instance を呼び出してパルスを模擬実行する
-            app = getattr(self.master, "app_instance", None)
-            if app:
+        f_out_test = tk.Frame(inner_t, bg=COLOR_BG_PANEL)
+        f_out_test.pack(fill=tk.X)
+
+        def _make_out_test_row(parent, label, pin_var, tip):
+            row = tk.Frame(parent, bg=COLOR_BG_PANEL)
+            row.pack(fill=tk.X, pady=5)
+
+            lbl = tk.Label(row, text=label, font=FONT_SET_VAL, bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN, anchor="w", width=12)
+            lbl.pack(side=tk.LEFT)
+
+            btn = tk.Button(row, text="テスト点灯", font=FONT_NORMAL, bg="#546E7A", fg="white", relief="flat", padx=8)
+            btn.pack(side=tk.LEFT, padx=5)
+
+            led = tk.Canvas(row, width=20, height=20, bg=COLOR_BG_PANEL, highlightthickness=0)
+            led.pack(side=tk.LEFT, padx=5)
+            circle = led.create_oval(2, 2, 18, 18, fill="#333333", outline="#555555")
+
+            def _toggle_out(pv=pin_var, l=led, c=circle):
+                app = getattr(self.master, "app_instance", None)
+                if not app: return
                 try:
-                    pin = int(pin_var.get())
-                    sec = float(duration_var.get())
-                    app.pulse_test_output(pin, sec)
-                except Exception as e:
-                    messagebox.showerror("テストエラー", f"出力テスト失敗: {e}", parent=self)
+                    pin = int(pv.get())
+                except ValueError:
+                    return
+                cur_color = l.itemcget(c, "fill")
+                turn_on = (cur_color == "#333333")
+                if app.toggle_output_pin_by_num(pin, turn_on):
+                    l.itemconfig(c, fill=COLOR_OK if turn_on else "#333333")
 
-        b_ok = tk.Button(btn_grid, text="OK出力テスト", font=FONT_BOLD, bg=COLOR_BG_INPUT, fg=COLOR_TEXT_MAIN, relief="flat", width=13,
-                         command=lambda: _trigger_test_pulse(self.v_output_ok_pin, self.v_output_ok_duration))
-        b_ok.pack(side=tk.LEFT, padx=5, pady=5)
+            btn.config(command=_toggle_out)
+            Tooltip(btn, f"{label}の物理/仮想ピンをON/OFFトグル点灯します。")
 
-        b_ng = tk.Button(btn_grid, text="NG出力テスト", font=FONT_BOLD, bg=COLOR_BG_INPUT, fg=COLOR_TEXT_MAIN, relief="flat", width=13,
-                         command=lambda: _trigger_test_pulse(self.v_output_ng_pin, self.v_output_ng_duration))
-        b_ng.pack(side=tk.LEFT, padx=5, pady=5)
+        _make_out_test_row(f_out_test, "運転中出力:", self.v_system_running_pin, "システム稼働出力")
+        _make_out_test_row(f_out_test, "OK出力:", self.v_output_ok_pin, "OK判定出力")
+        _make_out_test_row(f_out_test, "NG出力:", self.v_output_ng_pin, "NG判定出力")
+
+        # システム状態表示
+        outer_st, inner_st = create_card(col_right, "GPIOハードウェア状態")
+        outer_st.pack(fill=tk.X, pady=10)
+        self.lbl_gpio_status = tk.Label(inner_st, text="GPIO接続確認中...", font=FONT_BOLD, bg=COLOR_BG_PANEL, fg=COLOR_ACCENT)
+        self.lbl_gpio_status.pack(pady=10)
+
+        self._check_gpio_connection()
+        self._start_monitoring()
+
+    def _check_gpio_connection(self):
+        from .hardware import is_gpio_available
+        if hasattr(self, "lbl_gpio_status") and self.lbl_gpio_status.winfo_exists():
+            if is_gpio_available():
+                self.lbl_gpio_status.config(text="GPIO: 物理ピン接続済み", fg=COLOR_OK)
+            else:
+                self.lbl_gpio_status.config(text="GPIO: モック動作中 (PCテスト環境)", fg=COLOR_WARNING)
+
+    def _start_monitoring(self):
+        """入力ピンの状態をリアルタイム監視してLEDランプを更新する"""
+        if not self.winfo_exists():
+            return
+        if not hasattr(self, "t_gpio") or not self.t_gpio.winfo_exists():
+            return
+
+        app = getattr(self.master, "app_instance", None)
+        if app and hasattr(app, "trig_device") and app.trig_device:
+            state = getattr(app.trig_device, "is_active", False)
+            if hasattr(self, "trig_led") and self.trig_led.winfo_exists():
+                self.trig_led.itemconfig(self.trig_circle, fill=COLOR_OK if state else "#333333")
+
+        self.after(200, self._start_monitoring)
 
     def show_gpio_map(self, parent):
-        outer, inner = create_card(parent, "Pi 40Pin Map (クリックで入力)")
+        outer, inner = create_card(parent, "Pi 40Pin Map")
         outer.pack(fill=tk.BOTH, expand=True)
 
         def _on_pin_clicked(bcm_val):

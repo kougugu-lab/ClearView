@@ -70,8 +70,10 @@ class MockDevice:
 
 class MockInput(MockDevice):
     """入力デバイスのモック"""
-    def __init__(self, pin, *args, **kwargs):
+    def __init__(self, pin, pull_up=True, bounce_time=None, *args, **kwargs):
         self.pin = pin
+        self.pull_up = pull_up
+        self.bounce_time = bounce_time
         self._value = False
         self.when_activated = None
         self.when_deactivated = None
@@ -88,6 +90,14 @@ class MockInput(MockDevice):
     def off(self):
         self._value = False
         if self.when_deactivated: self.when_deactivated()
+
+    def toggle(self):
+        self._value = not self._value
+        if self._value and self.when_activated:
+            self.when_activated()
+        elif not self._value and self.when_deactivated:
+            self.when_deactivated()
+        return self._value
 
 
 try:

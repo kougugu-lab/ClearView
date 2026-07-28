@@ -21,6 +21,7 @@ class SettingsManager:
             },
             "gpio": {
                 "trigger_pin": 22,
+                "trigger_pull_up": True,
                 "output_ok_pin": 16,
                 "output_ng_pin": 20,
                 "system_running_pin": 5,

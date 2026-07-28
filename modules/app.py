@@ -121,9 +121,9 @@ class ClearViewApp:
             gpio = self.settings.data.get("gpio", {})
             cameras = self.settings.data.get("cameras", [])
 
-            # GPIO 入力
+            # GPIO 入力 (内部プルアップ常時有効・Active Low)
             trig_pin = gpio.get("trigger_pin", 22)
-            self.trig_device = DigitalInputDevice(trig_pin)
+            self.trig_device = DigitalInputDevice(trig_pin, pull_up=True, bounce_time=0.05)
             self.trig_device.when_activated = self._on_trigger
 
             # GPIO 出力
@@ -210,8 +210,17 @@ class ClearViewApp:
         self.logger.info(f"Camera {camera.get('name', camera_id)} opened (index {device_idx}, backend={backend}).")
 
     def _on_trigger(self):
-        """トリガー割り込み時のコールバック"""
+        """GPIOトリガー受信時のコールバック"""
+        self.logger.info("トリガーイベント検知")
         self.trigger_queue.put("trigger")
+
+    def test_trigger_input(self):
+        """GPIO設定画面からの手動テスト入力"""
+        self.logger.info("手動テスト・トリガー発火")
+        if hasattr(self, "trig_device") and hasattr(self.trig_device, "toggle"):
+            self.trig_device.toggle()
+        else:
+            self._on_trigger()
 
     def _apply_camera_props(self, cap, props: dict):
         """カメラプロパティを適用する（オート制御と手動値を連動）。"""
@@ -642,11 +651,6 @@ class ClearViewApp:
         self.root.after(0, lambda: self.update_status("トリガー待機中", None))
         while self.running:
             try:
-                # 設定画面が開いている間はスキップ
-                if self.settings_open:
-                    time.sleep(0.1)
-                    continue
-
                 # トリガー待機 (タイムアウト 0.5秒でポーリング)
                 try:
                     self.trigger_queue.get(timeout=0.5)
@@ -659,113 +663,6 @@ class ClearViewApp:
                 # 撮影シーケンス開始
                 self.inspecting = True
                 self._capture_all_cameras()
-                continue
-                commit_str = self.get_commit_str()
-                self.logger.info(f"トリガー受信 - コミット {commit_str}")
-                self.root.after(0, lambda: self.update_status("撮影中...", COLOR_ACCENT))
-
-                # 設定値読み込み
-                capture_count = int(self.settings.data["system"].get("capture_count", 5))
-                burst_interval = float(self.settings.data["system"].get("burst_interval", 0.2))
-                capture_res = self.settings.data["camera"].get("capture_resolution", "1920x1080")
-                preview_res = self.settings.data["camera"].get("preview_resolution", "640x480")
-                result_dir = Path(self.settings.data["paths"].get("results_dir", "./results"))
-                result_dir.mkdir(parents=True, exist_ok=True)
-
-                saved_files = []
-                error_occurred = False
-
-                try:
-                    # カメラ解像度を本撮影用に変更
-                    if "x" in capture_res:
-                        cw, ch = map(int, capture_res.split("x"))
-                        with self.camera_lock:
-                            if self.cap and self.cap.isOpened():
-                                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, cw)
-                                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, ch)
-                    time.sleep(0.3)  # 解像度切替安定待ち
-
-                    # バッファクリア
-                    with self.camera_lock:
-                        if self.cap and self.cap.isOpened():
-                            for _ in range(3):
-                                self.cap.grab()
-
-                    # 指定枚数の連続撮影
-                    for shot_idx in range(capture_count):
-                        with self.camera_lock:
-                            if self.cap is None or not self.cap.isOpened():
-                                error_occurred = True
-                                break
-                            ret, frame = self.cap.read()
-
-                        if not ret or frame is None or frame.size == 0:
-                            self.logger.warning(f"フレーム取得失敗 (shot {shot_idx + 1}/{capture_count})")
-                            error_occurred = True
-                            break
-
-                        # 非同期で保存
-                        filename = f"{commit_str}_{shot_idx + 1:02d}.jpg"
-                        filepath = result_dir / filename
-                        self._save_image_async(frame, filepath)
-                        saved_files.append(filename)
-                        self.logger.info(f"撮影 {shot_idx + 1}/{capture_count}: {filename}")
-
-                        # 撮影した画像をプレビューに表示
-                        self._show_frame_on_preview(frame)
-
-                        if shot_idx < capture_count - 1:
-                            time.sleep(burst_interval)
-
-                except Exception as e:
-                    self.logger.error(f"撮影処理エラー: {e}")
-                    error_occurred = True
-
-                finally:
-                    # プレビュー解像度に戻す
-                    if preview_res not in ("プレビューなし", "") and "x" in preview_res:
-                        pw, ph = map(int, preview_res.split("x"))
-                        with self.camera_lock:
-                            if self.cap and self.cap.isOpened():
-                                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, pw)
-                                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, ph)
-
-                # 結果処理
-                if error_occurred or not saved_files:
-                    self.logger.error(f"撮影失敗 - コミット {commit_str}")
-                    self.root.after(0, lambda: self.update_status("撮影エラー", COLOR_NG))
-                    self._pulse_gpio(self.out_ng, self.settings.data["gpio"].get("output_ng_duration", 0.5))
-                    self.result_display_until = time.time() + 2.0
-                else:
-                    # 撮影成功
-                    count = len(saved_files)
-                    self.shot_count += count
-                    self.logger.info(f"撮影完了 - コミット {commit_str} / {count}枚保存")
-                    status_text = f"撮影完了 - {commit_str} ({count}枚)"
-                    self.root.after(0, lambda t=status_text: self.update_status(t, COLOR_OK))
-
-                    # 統計・履歴を更新 (Tkinterはメインスレッドのみ)
-                    now_str = datetime.datetime.now().strftime("%H:%M:%S")
-                    def _update_ui(c=commit_str, n=count, ts=now_str, f_list=saved_files):
-                        self.v_count.set(f"{self.shot_count} 枚")
-                        self.v_commit.set(self.get_commit_str())
-                        self.v_last_shot.set(f"{ts}  #{c}  {n}枚\n{f_list[0] if f_list else ''}")
-                    self.root.after(0, _update_ui)
-
-                    # OK GPIO 出力
-                    self._pulse_gpio(self.out_ok, self.settings.data["gpio"].get("output_ok_duration", 0.5))
-
-                    # コミット番号インクリメント
-                    self.commit_number += 1.0
-                    if self.commit_number > 9999:
-                        self.commit_number = 1.0
-
-                    # 結果表示時間
-                    disp_time = float(self.settings.data["system"].get("result_display_time", 2.0))
-                    self.result_display_until = time.time() + disp_time
-
-                # 撮影完了
-                self.inspecting = False
                 time.sleep(0.3)
                 self.root.after(0, lambda: self.update_status("トリガー待機中", None))
 
@@ -773,7 +670,7 @@ class ClearViewApp:
                 import traceback
                 self.logger.error(f"メインロジックエラー: {e}\n{traceback.format_exc()}")
                 self.inspecting = False
-                time.sleep(1.0)
+                time.sleep(0.5)
 
     def _save_image_async(self, frame, filepath):
         """画像を非同期で保存"""
@@ -843,9 +740,31 @@ class ClearViewApp:
         threading.Thread(target=_do, daemon=True).start()
 
     def pulse_test_output(self, pin, duration):
-        """設定画面からのテスト出力"""
+        """設定画面からのパルス出力テスト"""
         dev = OutputDevice(pin)
         self._pulse_gpio(dev, duration)
+
+    def toggle_output_pin_by_num(self, pin: int, turn_on: bool) -> bool:
+        """設定画面からのテスト点灯（ON/OFFトグル切替）"""
+        try:
+            # 既存の出力デバイスで一致するものがあれば使用、無ければ一時生成
+            target_dev = None
+            for dev in (getattr(self, "out_ok", None), getattr(self, "out_ng", None), getattr(self, "out_running", None)):
+                if dev and hasattr(dev, "pin") and str(dev.pin) == str(pin):
+                    target_dev = dev
+                    break
+            if target_dev is None:
+                target_dev = OutputDevice(pin)
+            
+            if turn_on:
+                target_dev.on()
+            else:
+                target_dev.off()
+            self.logger.info(f"出力ピン BCM {pin} テスト点灯: {'ON' if turn_on else 'OFF'}")
+            return True
+        except Exception as e:
+            self.logger.error(f"出力ピンテストエラー (BCM {pin}): {e}")
+            return False
 
     # ------------------------------------------------------------------
     # 容量監視
