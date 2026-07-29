@@ -44,6 +44,7 @@ class ClearViewApp:
         self.commit_number = 1.0
         self.running = True
         self.camera_lock = threading.Lock()
+        self._save_lock = threading.Lock()
         self.trigger_queue = queue.Queue()
         self.caps = {}
         self.last_frames = {}
@@ -573,6 +574,54 @@ class ClearViewApp:
                 self.logger.warning(f"Preview failed for {camera_id}: {exc}")
         return bool(self.caps)
 
+    @staticmethod
+    def _parse_resolution(resolution_str):
+        """解像度文字列から (width, height) を取得。不正な場合は None。"""
+        raw = str(resolution_str).split(" ")[0]
+        if "x" not in raw:
+            return None
+        try:
+            width, height = map(int, raw.split("x"))
+            return width, height
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _capture_settle_seconds(width, height):
+        """解像度に応じたカメラバッファ安定化待機時間（秒）"""
+        pixels = width * height
+        if pixels >= 8000 * 6000:
+            return 2.0
+        if pixels >= 3840 * 2160:
+            return 1.0
+        if pixels >= 1920 * 1080:
+            return 0.5
+        return 0.3
+
+    def _read_camera_frame(self, cap, width=0, height=0):
+        """grab/retrieve をリトライ付きで実行（高解像度向け）"""
+        if not cap or not cap.isOpened():
+            return False, None
+        pixels = width * height if width and height else 0
+        if pixels >= 8000 * 6000:
+            retries, retry_delay = 10, 0.2
+        elif pixels >= 3840 * 2160:
+            retries, retry_delay = 6, 0.15
+        else:
+            retries, retry_delay = 3, 0.1
+        for _ in range(retries):
+            with self.camera_lock:
+                grabbed = cap.grab()
+            if not grabbed:
+                time.sleep(retry_delay)
+                continue
+            with self.camera_lock:
+                ret, frame = cap.retrieve()
+            if ret and frame is not None and frame.size > 0:
+                return True, frame.copy()
+            time.sleep(retry_delay)
+        return False, None
+
     def _capture_all_cameras(self):
         """1トリガーで有効な全カメラを同じバースト回数だけ撮影する。"""
         commit_str = self.get_commit_str()
@@ -584,23 +633,27 @@ class ClearViewApp:
         saved_files, errors = [], []
         self.root.after(0, lambda: self.update_status("撮影中...", COLOR_ACCENT))
         try:
+            max_settle = 0.3
             with self.camera_lock:
                 for camera in cameras:
                     cap = self.caps.get(camera["id"])
-                    resolution = camera.get("capture_resolution", "1920x1080").split(" ")[0]
-                    if cap and cap.isOpened() and "x" in resolution:
-                        width, height = map(int, resolution.split("x"))
+                    parsed = self._parse_resolution(camera.get("capture_resolution", "1920x1080"))
+                    if cap and cap.isOpened() and parsed:
+                        width, height = parsed
                         cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
                         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-                        for _ in range(3):
+                        flush_count = 5 if width * height >= 8000 * 6000 else 3
+                        for _ in range(flush_count):
                             cap.grab()
-            time.sleep(0.3)
+                        max_settle = max(max_settle, self._capture_settle_seconds(width, height))
+            time.sleep(max_settle)
             for shot_idx in range(capture_count):
                 for camera in cameras:
                     camera_id = camera["id"]
                     cap = self.caps.get(camera_id)
-                    with self.camera_lock:
-                        ret, frame = cap.read() if cap and cap.isOpened() else (False, None)
+                    parsed = self._parse_resolution(camera.get("capture_resolution", "1920x1080"))
+                    cap_w, cap_h = parsed if parsed else (0, 0)
+                    ret, frame = self._read_camera_frame(cap, cap_w, cap_h)
                     if not ret or frame is None or frame.size == 0:
                         errors.append(camera.get("name", camera_id))
                         continue
@@ -610,7 +663,7 @@ class ClearViewApp:
                     saved_files.append(filename)
                     self._show_frame_on_preview(frame, camera)
                     self.logger.info(f"Captured {camera_id} {shot_idx + 1}/{capture_count}: {filename}")
-                if shot_idx < capture_count - 1:
+                if shot_idx < capture_count - 1 and interval > 0:
                     time.sleep(interval)
         except Exception as exc:
             self.logger.error(f"Multi-camera capture error: {exc}")
@@ -626,20 +679,33 @@ class ClearViewApp:
                         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
 
         expected = len(cameras) * capture_count
-        if errors or len(saved_files) != expected:
-            self.logger.error(f"Capture error - commit {commit_str}: {errors}")
-            self.root.after(0, lambda: self.update_status("撮影エラー", COLOR_NG))
-            self._pulse_gpio(self.out_ng, self.settings.data["gpio"].get("output_ng_duration", 0.5))
-        else:
+        success = not errors and len(saved_files) == expected
+        if success:
             self.shot_count += len(saved_files)
             self.root.after(0, lambda: self.update_status(f"撮影成功 - {commit_str} ({len(saved_files)}枚)", COLOR_OK))
             self._pulse_gpio(self.out_ok, self.settings.data["gpio"].get("output_ok_duration", 0.5))
             now = datetime.datetime.now().strftime("%H:%M:%S")
             self.root.after(0, lambda: self.v_count.set(f"{self.shot_count} 枚"))
             self.root.after(0, lambda: self.v_last_shot.set(f"{now}  #{commit_str}  {len(saved_files)}枚\n{saved_files[0]}"))
-            step = 0.5 if self.settings.data["system"].get("commit_half_step", False) else 1.0
-            self.commit_number = 1.0 if self.commit_number >= 9999.0 else self.commit_number + step
-            self.root.after(0, lambda: self.v_commit.set(self.get_commit_str()))
+        else:
+            self.logger.error(f"Capture error - commit {commit_str}: {errors}")
+            saved_count = len(saved_files)
+            self.root.after(
+                0,
+                lambda: self.update_status(
+                    f"撮影エラー - {commit_str} ({saved_count}/{expected}枚)" if saved_count else "撮影エラー",
+                    COLOR_NG,
+                ),
+            )
+            self._pulse_gpio(self.out_ng, self.settings.data["gpio"].get("output_ng_duration", 0.5))
+            if saved_files:
+                now = datetime.datetime.now().strftime("%H:%M:%S")
+                self.root.after(0, lambda: self.v_last_shot.set(f"{now}  #{commit_str}  {saved_count}枚 (一部失敗)\n{saved_files[0]}"))
+
+        # 1サイクル完了ごとにコミット番号を進める（撮影失敗時も進行）
+        step = 0.5 if self.settings.data["system"].get("commit_half_step", False) else 1.0
+        self.commit_number = 1.0 if self.commit_number >= 9999.0 else self.commit_number + step
+        self.root.after(0, lambda: self.v_commit.set(self.get_commit_str()))
         self.result_display_until = time.time() + float(self.settings.data["system"].get("result_display_time", 2.0))
         self.inspecting = False
 
@@ -673,25 +739,30 @@ class ClearViewApp:
                 time.sleep(0.5)
 
     def _save_image_async(self, frame, filepath):
-        """画像を非同期で保存"""
-        def _write(f=frame, p=filepath):
+        """画像を非同期で保存（高解像度時のメモリ競合を避けるため直列化）"""
+        frame_copy = frame.copy()
+
+        def _write(f=frame_copy, p=filepath):
             try:
-                # cv2.imwrite は Windows で日本語パスを正しく扱えないため、
-                # imencode でメモリにエンコードしてから Python の open() で書き込む
-                ext = p.suffix.lower()  # 例: ".jpg"
-                ret, buf = cv2.imencode(ext, f)
-                if ret:
-                    with open(p, "wb") as fh:
-                        fh.write(buf.tobytes())
-                    self.logger.info(f"保存成功: {p.name}")
-                else:
-                    self.logger.error(f"保存失敗 (imencode): {p}")
+                with self._save_lock:
+                    # cv2.imwrite は Windows で日本語パスを正しく扱えないため、
+                    # imencode でメモリにエンコードしてから Python の open() で書き込む
+                    ext = p.suffix.lower()  # 例: ".jpg"
+                    ret, buf = cv2.imencode(ext, f)
+                    if ret:
+                        with open(p, "wb") as fh:
+                            fh.write(buf.tobytes())
+                        self.logger.info(f"保存成功: {p.name}")
+                    else:
+                        self.logger.error(f"保存失敗 (imencode): {p}")
             except Exception as e:
                 self.logger.error(f"保存エラー ({p.name}): {e}")
+            finally:
+                del f
         threading.Thread(target=_write, daemon=True).start()
 
     def _show_frame_on_preview(self, frame, camera):
-        """撮影フレームをプレビューに表示 (アスペクト比維持・高速リサイズ・GC回避)"""
+        """撮影フレームをプレビューに表示 (8K等の高解像度はUIスレッド渡し前に縮小)"""
         preview_res = camera.get("preview_resolution", "640x480").split(" ")[0]
         if preview_res in ("プレビューなし", ""):
             return
@@ -704,18 +775,20 @@ class ClearViewApp:
             return
         label.is_updating = True
 
-        def _upd(f=frame, pr=preview_res, lbl=label):
+        try:
+            pw, ph = map(int, preview_res.split("x"))
+            h, w = frame.shape[:2]
+            scale = min(pw / w, ph / h)
+            nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+            thumb = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
+            rgb = cv2.cvtColor(thumb, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(rgb)
+        except Exception:
+            label.is_updating = False
+            return
+
+        def _upd(lbl=label, pil_img=pil_img, nw=nw, nh=nh):
             try:
-                pw, ph = map(int, pr.split("x"))
-                h, w = f.shape[:2]
-                # アスペクト比を維持して表示エリアに収まるよう縮小
-                scale = min(pw / w, ph / h)
-                nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
-                # 縮小後に BGR→RGB 変換することで処理バイト数を削減
-                img = cv2.resize(f, (nw, nh), interpolation=cv2.INTER_NEAREST)
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                pil_img = Image.fromarray(img)
-                # 既存 PhotoImage と寸法が異なる場合は作り直し（左上切り取りバグ防止）
                 cur_img = getattr(lbl, "img", None)
                 if cur_img is None or cur_img.width() != nw or cur_img.height() != nh:
                     lbl.img = ImageTk.PhotoImage(pil_img)

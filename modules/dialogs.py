@@ -785,7 +785,7 @@ class SettingsDialog(tk.Toplevel):
             Tooltip(lbl, tip)
 
         _make_sys_row(inner_param, "撮影回数 (回):", self.v_capture_count, "トリガー受信時に連続して撮影する最大枚数です。", 1, 99)
-        _make_sys_row(inner_param, "撮影間隔 (秒):", self.v_burst_interval, "連続撮影時の撮影フレーム間の時間間隔です。", 0.1, 10.0)
+        _make_sys_row(inner_param, "撮影間隔 (秒):", self.v_burst_interval, "連続撮影時の撮影フレーム間の時間間隔です。0で間隔なし。", 0.0, 10.0)
         _make_sys_row(inner_param, "結果画像表示時間 (秒):", self.v_result_display_time, "撮影結果を画面に表示し続ける時間（秒）です。", 0.5, 10.0)
         _make_sys_row(inner_param, "プレビュー更新レート (FPS):", self.v_preview_fps, "リアルタイムプレビューの表示更新フレームレートです (1〜60 fps)。", 1, 60)
 
@@ -1287,13 +1287,17 @@ class SettingsDialog(tk.Toplevel):
             int(self.v_brightness.get())
             int(self.v_contrast.get())
             int(self.v_capture_count.get())
-            float(self.v_burst_interval.get())
+            burst_interval = float(self.v_burst_interval.get())
             float(self.v_result_display_time.get())
             float(self.v_output_ok_duration.get())
             float(self.v_output_ng_duration.get())
             float(self.v_max_results_gb.get())
         except ValueError:
             messagebox.showerror("バリデーションエラー", "入力された数値フィールドに不正な文字が含まれています。", parent=self)
+            return
+
+        if burst_interval < 0:
+            messagebox.showerror("バリデーションエラー", "撮影間隔は 0 以上で入力してください。", parent=self)
             return
 
         # 変更された値を一時データに書き戻し
@@ -1311,7 +1315,7 @@ class SettingsDialog(tk.Toplevel):
         self.temp_data["gpio"]["output_ng_duration"] = float(self.v_output_ng_duration.get())
 
         self.temp_data["system"]["capture_count"] = int(self.v_capture_count.get())
-        self.temp_data["system"]["burst_interval"] = float(self.v_burst_interval.get())
+        self.temp_data["system"]["burst_interval"] = burst_interval
         self.temp_data["system"]["result_display_time"] = float(self.v_result_display_time.get())
         self.temp_data["system"]["auto_delete_enabled"] = self.v_auto_delete_enabled.get()
         self.temp_data["system"]["max_results_gb"] = float(self.v_max_results_gb.get())

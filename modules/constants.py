@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 
 # --- バージョン ---
-VERSION = "v1.3.1"
+VERSION = "v1.3.3"
 
 # --- ファイル・パス ---
 SETTINGS_FILE = "config.json"
