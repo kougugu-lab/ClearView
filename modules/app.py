@@ -186,7 +186,8 @@ class ClearViewApp:
         safe_name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", str(name)).strip(" .")
         return safe_name or fallback
 
-    def _open_camera(self, camera):
+    def _open_camera_device(self, camera, target_res_str=None):
+        """指定された解像度で VideoCapture をオープンしプロパティを適用する。"""
         camera_id = camera["id"]
         device_idx = int(camera.get("capture_device", 0))
         if sys.platform.startswith("linux"):
@@ -197,18 +198,29 @@ class ClearViewApp:
             backend = cv2.CAP_ANY
         cap = cv2.VideoCapture(device_idx, backend)
         if not cap.isOpened():
-            self.logger.warning(f"Camera {camera.get('name', camera_id)} (index {device_idx}) could not be opened.")
-            return
+            self.logger.warning(f"カメラ '{camera.get('name', camera_id)}' (インデックス {device_idx}) をオープンできませんでした。")
+            return None
+
+        res_str = target_res_str or camera.get("preview_resolution", "640x480")
+        parsed = self._parse_resolution(res_str)
+        if parsed:
+            cw, ch = parsed
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, cw)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, ch)
+
+        # 解像度設定直後に再度 MJPG フォーマットを強制（V4L2で解像度セット時にYUYVへリセットされ、USB2.0で帯域オーバーになるのを防止）
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        preview_res = camera.get("preview_resolution", "640x480").split(" ")[0]
-        if preview_res not in ("プレビューなし", "") and "x" in preview_res:
-            pw, ph = map(int, preview_res.split("x"))
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, pw)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, ph)
+
         self._apply_camera_props(cap, camera.get("camera_props", {}))
-        self.caps[camera_id] = cap
-        self.logger.info(f"Camera {camera.get('name', camera_id)} opened (index {device_idx}, backend={backend}).")
+        return cap
+
+    def _open_camera(self, camera):
+        """待機・プレビュー用解像度でカメラを初期オープンする。"""
+        cap = self._open_camera_device(camera)
+        if cap:
+            self.caps[camera["id"]] = cap
+            self.logger.info(f"カメラ '{camera.get('name', camera['id'])}' を初期化しました（インデックス: {camera.get('capture_device', 0)}）。")
 
     def _on_trigger(self):
         """GPIOトリガー受信時のコールバック"""
@@ -623,7 +635,7 @@ class ClearViewApp:
         return False, None
 
     def _capture_all_cameras(self):
-        """1トリガーで有効な全カメラを同じバースト回数だけ撮影する。"""
+        """1トリガーで有効な全カメラを同じバースト回数だけ撮影する。異解像度の場合は安全にクローズ＆再オープンする。"""
         commit_str = self.get_commit_str()
         cameras = self._camera_configs()
         capture_count = int(self.settings.data["system"].get("capture_count", 5))
@@ -632,21 +644,45 @@ class ClearViewApp:
         result_dir.mkdir(parents=True, exist_ok=True)
         saved_files, errors = [], []
         self.root.after(0, lambda: self.update_status("撮影中...", COLOR_ACCENT))
+
+        prev_paused = self.preview_paused
+        self.preview_paused = True  # プレビューループを停止
+
+        reopened_caps = {}
         try:
-            max_settle = 0.3
+            # 各カメラについて、preview_resolution と capture_resolution が異なるか判定
+            with self.camera_lock:
+                for camera in cameras:
+                    cid = camera["id"]
+                    prev_res = camera.get("preview_resolution", "640x480").split(" ")[0]
+                    capt_res = camera.get("capture_resolution", "1920x1080").split(" ")[0]
+
+                    # プレビューと撮影で解像度が異なる場合、安全に release() して 8K (capt_res) で再オープン
+                    if prev_res != capt_res and "x" in capt_res:
+                        old_cap = self.caps.get(cid)
+                        if old_cap and old_cap.isOpened():
+                            old_cap.release()
+                        self.logger.info(f"【カメラ再オープン】'{cid}' 本撮影用解像度に切り替え: {prev_res} -> {capt_res}")
+                        new_cap = self._open_camera_device(camera, capt_res)
+                        if new_cap:
+                            self.caps[cid] = new_cap
+                            reopened_caps[cid] = prev_res
+
+            # バッファのフラッシュと解像度安定化待機
+            max_settle = 0.5
             with self.camera_lock:
                 for camera in cameras:
                     cap = self.caps.get(camera["id"])
-                    parsed = self._parse_resolution(camera.get("capture_resolution", "1920x1080"))
-                    if cap and cap.isOpened() and parsed:
-                        width, height = parsed
-                        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-                        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-                        flush_count = 5 if width * height >= 8000 * 6000 else 3
-                        for _ in range(flush_count):
+                    if cap and cap.isOpened():
+                        parsed = self._parse_resolution(camera.get("capture_resolution", "1920x1080"))
+                        if parsed:
+                            w, h = parsed
+                            max_settle = max(max_settle, self._capture_settle_seconds(w, h))
+                        for _ in range(2):
                             cap.grab()
-                        max_settle = max(max_settle, self._capture_settle_seconds(width, height))
             time.sleep(max_settle)
+
+            # 指定枚数の連続撮影
             for shot_idx in range(capture_count):
                 for camera in cameras:
                     camera_id = camera["id"]
@@ -662,21 +698,28 @@ class ClearViewApp:
                     self._save_image_async(frame, result_dir / filename)
                     saved_files.append(filename)
                     self._show_frame_on_preview(frame, camera)
-                    self.logger.info(f"Captured {camera_id} {shot_idx + 1}/{capture_count}: {filename}")
+                    self.logger.info(f"【撮影成功】{camera_id} ({shot_idx + 1}/{capture_count}枚目): {filename}")
                 if shot_idx < capture_count - 1 and interval > 0:
                     time.sleep(interval)
         except Exception as exc:
-            self.logger.error(f"Multi-camera capture error: {exc}")
+            self.logger.error(f"マルチカメラ撮影エラー: {exc}")
             errors.append(str(exc))
         finally:
-            with self.camera_lock:
-                for camera in cameras:
-                    cap = self.caps.get(camera["id"])
-                    resolution = camera.get("preview_resolution", "640x480").split(" ")[0]
-                    if cap and cap.isOpened() and resolution not in ("プレビューなし", "") and "x" in resolution:
-                        width, height = map(int, resolution.split("x"))
-                        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-                        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            # 8Kで再オープンしていたカメラをクローズし、元のプレビュー解像度で再オープン
+            if reopened_caps:
+                with self.camera_lock:
+                    for camera in cameras:
+                        cid = camera["id"]
+                        if cid in reopened_caps:
+                            prev_res = reopened_caps[cid]
+                            capt_cap = self.caps.get(cid)
+                            if capt_cap and capt_cap.isOpened():
+                                capt_cap.release()
+                            self.logger.info(f"【カメラ復帰】'{cid}' プレビュー用解像度に再オープン復帰: {prev_res}")
+                            prev_cap = self._open_camera_device(camera, prev_res)
+                            if prev_cap:
+                                self.caps[cid] = prev_cap
+            self.preview_paused = prev_paused  # プレビュー再開
 
         expected = len(cameras) * capture_count
         success = not errors and len(saved_files) == expected
