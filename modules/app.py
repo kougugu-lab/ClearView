@@ -427,31 +427,62 @@ class ClearViewApp:
         self.root.after(1000, self.update_clock)
 
     def on_closing(self):
-        if messagebox.askokcancel("終了", "アプリケーションを終了しますか？"):
+        """アプリケーション終了時のクリーンアップ処理"""
+        if getattr(self, "_is_closing_dialog_open", False):
+            return
+        self._is_closing_dialog_open = True
+
+        try:
+            if not hasattr(self, "root") or not self.root.winfo_exists():
+                confirmed = True
+            else:
+                confirmed = messagebox.askokcancel("終了", "アプリケーションを終了しますか？", parent=self.root)
+        except Exception:
+            confirmed = True
+
+        if confirmed:
             self.running = False
-            self._release_cameras()
             self.logger.info("シャットダウン処理を開始します...")
+
             # GPIO 解放
             try:
                 for dev in [self.trig_device, self.out_ok, self.out_ng, self.out_running]:
                     if dev:
-                        self.out_running.off() if dev == self.out_running else None
-                        dev.close()
+                        if dev == self.out_running and hasattr(dev, "off"):
+                            try:
+                                dev.off()
+                            except Exception:
+                                pass
+                        try:
+                            dev.close()
+                        except Exception:
+                            pass
             except Exception as e:
                 self.logger.error(f"GPIO解放エラー: {e}")
+
             # カメラ解放
             try:
                 self._release_cameras()
             except Exception as e:
                 self.logger.error(f"カメラ解放エラー: {e}")
+
             # 仮想GPIOパネル解放
             try:
                 if hasattr(self, "mock_root") and self.mock_root.winfo_exists():
                     self.mock_root.destroy()
             except Exception:
                 pass
-            self.root.destroy()
+
+            # ウィンドウ破棄
+            try:
+                if hasattr(self, "root") and self.root.winfo_exists():
+                    self.root.destroy()
+            except Exception as e:
+                self.logger.error(f"ウィンドウ破棄エラー: {e}")
+
             self.logger.info("シャットダウン完了")
+        else:
+            self._is_closing_dialog_open = False
 
     # ------------------------------------------------------------------
     # コミット番号管理

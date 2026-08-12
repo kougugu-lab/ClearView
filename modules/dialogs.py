@@ -41,6 +41,325 @@ def _to_raw(s):
     return s.split(" ")[0] if "x" in s else s
 
 
+NON_CAMERA_KEYWORDS = (
+    "bcm2835-codec", "bcm2835-isp", "rpivid", "pisp", "m2m",
+    "codec", "decode", "encode", "isp", "video-codec", "vc4", "h264", "hevc"
+)
+
+def detect_available_cameras():
+    """OSが認識しているカメラデバイスを自動探索し、
+    [(index_int, display_label_str), ...] のリストを返す
+    （Raspberry Piの動画デコーダ/ISPノード等は除外）
+    """
+    import subprocess
+    devices = []
+
+    if sys.platform.startswith("linux"):
+        v4l_dir = "/sys/class/video4linux"
+        if os.path.exists(v4l_dir):
+            for entry in sorted(os.listdir(v4l_dir)):
+                if entry.startswith("video"):
+                    try:
+                        idx = int(entry.replace("video", ""))
+                        name_file = os.path.join(v4l_dir, entry, "name")
+                        cam_name = f"カメラ {idx}"
+                        if os.path.exists(name_file):
+                            with open(name_file, "r", encoding="utf-8", errors="ignore") as f:
+                                name_text = f.read().strip()
+                                if name_text:
+                                    cam_name = name_text
+
+                        # Raspberry Piの動画デコーダ・ISP・M2Mノードはキャプチャ不可のため事前スキップ
+                        cam_name_lower = cam_name.lower()
+                        if any(kw in cam_name_lower for kw in NON_CAMERA_KEYWORDS):
+                            continue
+
+                        cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+                        if cap and cap.isOpened():
+                            ret, _ = cap.read()
+                            if ret:
+                                devices.append((idx, f"[{idx}] {cam_name}"))
+                            cap.release()
+                    except Exception:
+                        pass
+    elif sys.platform.startswith("win"):
+        names_from_ps = []
+        try:
+            ps_cmd = 'Get-CimInstance Win32_PnPEntity | Where-Object {$_.PNPClass -eq "Camera" -or $_.PNPClass -eq "Image"} | Select-Object -ExpandProperty Name'
+            res = subprocess.run(["powershell", "-Command", ps_cmd], capture_output=True, text=True, timeout=3)
+            if res.returncode == 0 and res.stdout:
+                names_from_ps = [line.strip() for line in res.stdout.splitlines() if line.strip()]
+        except Exception:
+            pass
+
+        open_indices = []
+        for idx in range(10):
+            try:
+                cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+                if not cap.isOpened():
+                    cap = cv2.VideoCapture(idx, cv2.CAP_ANY)
+                if cap and cap.isOpened():
+                    ret, _ = cap.read()
+                    if ret:
+                        open_indices.append(idx)
+                    cap.release()
+            except Exception:
+                pass
+
+        for i, idx in enumerate(open_indices):
+            if i < len(names_from_ps):
+                d_name = names_from_ps[i]
+            else:
+                d_name = f"USB Camera {idx}"
+            devices.append((idx, f"[{idx}] {d_name}"))
+
+    if not devices:
+        for idx in range(4):
+            devices.append((idx, f"[{idx}] カメラ (インデックス {idx})"))
+
+    return devices
+
+
+def get_desktop_path():
+    """デスクトップフォルダのパスを取得する"""
+    home = os.path.expanduser("~")
+    if sys.platform.startswith("win"):
+        desktop = os.path.join(home, "Desktop")
+        if os.path.exists(desktop):
+            return desktop
+        try:
+            import winreg
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+            )
+            path, _ = winreg.QueryValueEx(key, "Desktop")
+            winreg.CloseKey(key)
+            expanded = os.path.expandvars(path)
+            if os.path.exists(expanded):
+                return expanded
+        except Exception:
+            pass
+        return desktop
+    else:
+        desktop = os.path.join(home, "Desktop")
+        if os.path.exists(desktop):
+            return desktop
+        desktop_ja = os.path.join(home, "デスクトップ")
+        if os.path.exists(desktop_ja):
+            return desktop_ja
+        user_dirs = os.path.join(home, ".config", "user-dirs.dirs")
+        if os.path.exists(user_dirs):
+            try:
+                with open(user_dirs, "r", encoding="utf-8") as f:
+                    for line in f:
+                        if line.startswith("XDG_DESKTOP_DIR"):
+                            p = line.split("=")[1].strip().strip('"')
+                            p = p.replace("$HOME", home)
+                            if os.path.exists(p):
+                                return p
+            except Exception:
+                pass
+        return desktop
+
+
+def create_desktop_launcher(parent=None):
+    """デスクトップにワンクリック起動ファイル (.bat / .sh) を生成する"""
+    try:
+        desktop_dir = get_desktop_path()
+        if not os.path.exists(desktop_dir):
+            os.makedirs(desktop_dir, exist_ok=True)
+
+        app_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        python_exe = sys.executable
+
+        is_win = sys.platform.startswith("win")
+        if is_win:
+            filename = "ClearView起動.bat"
+            file_path = os.path.join(desktop_dir, filename)
+            content = (
+                "@echo off\n"
+                "chcp 65001 > nul\n"
+                "title ClearView 静止画撮影システム\n"
+                f'cd /d "{app_dir}"\n'
+                f'"{python_exe}" main.py\n'
+                "if %errorlevel% neq 0 (\n"
+                "    echo.\n"
+                "    echo エラーが発生しました。キーを押すと終了します...\n"
+                "    pause > nul\n"
+                ")\n"
+            )
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(content)
+        else:
+            filename = "ClearView起動.sh"
+            file_path = os.path.join(desktop_dir, filename)
+            content = (
+                "#!/bin/bash\n"
+                f'cd "{app_dir}"\n'
+                f'"{python_exe}" main.py\n'
+                "if [ $? -ne 0 ]; then\n"
+                '    read -p "エラーが発生しました。Enterキーを押すと終了します..."\n'
+                "fi\n"
+            )
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            try:
+                os.chmod(file_path, 0o755)
+            except Exception:
+                pass
+
+        messagebox.showinfo(
+            "ショートカット作成完了",
+            f"デスクトップに起動スクリプトを作成しました:\n\n{file_path}",
+            parent=parent
+        )
+    except Exception as ex:
+        messagebox.showerror(
+            "作成失敗",
+            f"起動スクリプトの作成中にエラーが発生しました:\n{ex}",
+            parent=parent
+        )
+
+
+class SystemDateTimeDialog(tk.Toplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("本体日時設定 (システムクロック設定)")
+        self.geometry("560x490")
+        self.configure(bg=COLOR_BG_MAIN)
+        self.transient(parent)
+        self.grab_set()
+
+        try:
+            configure_modal_toplevel(self)
+        except Exception:
+            pass
+
+        from datetime import datetime
+        now = datetime.now()
+
+        f_btns = tk.Frame(self, bg=COLOR_BG_MAIN)
+        f_btns.pack(side=tk.BOTTOM, fill=tk.X, pady=20, padx=24)
+
+        def _apply():
+            try:
+                y = self.v_year.get()
+                m = self.v_month.get()
+                d = self.v_day.get()
+                h = self.v_hour.get()
+                mi = self.v_min.get()
+                s = self.v_sec.get()
+                dt_str = f"{y:04d}-{m:02d}-{d:02d} {h:02d}:{mi:02d}:{s:02d}"
+            except Exception as ex:
+                messagebox.showerror("入力エラー", f"日時の入力値が不正です:\n{ex}", parent=self)
+                return
+
+            if sys.platform.startswith("win"):
+                messagebox.showinfo(
+                    "日時設定 (Windows)",
+                    f"Windows環境のため実際のシステム時刻変更はスキップされました。\n設定指定値: {dt_str}\n(Linux/ラズパイ環境で自動設定コマンドが実行されます)",
+                    parent=self
+                )
+                self.destroy()
+                return
+
+            import subprocess
+            cmds = [
+                ["sudo", "timedatectl", "set-ntp", "false"],
+                ["sudo", "timedatectl", "set-time", dt_str],
+                ["sudo", "date", "-s", dt_str],
+                ["sudo", "hwclock", "-w"]
+            ]
+            results = []
+            success_count = 0
+            for cmd in cmds:
+                try:
+                    res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                    if res.returncode == 0:
+                        success_count += 1
+                        results.append(f"成功: {' '.join(cmd)}")
+                    else:
+                        err = res.stderr.strip() or res.stdout.strip()
+                        results.append(f"失敗 ({' '.join(cmd)}): {err}")
+                except Exception as ex:
+                    results.append(f"エラー ({' '.join(cmd)}): {ex}")
+
+            msg = f"日時を [{dt_str}] に設定しました。\n\n【実行詳細】\n" + "\n".join(results)
+            if success_count > 0:
+                messagebox.showinfo("日時設定完了", msg, parent=self)
+                self.destroy()
+            else:
+                messagebox.showerror("日時設定失敗", msg, parent=self)
+
+        btn_save = tk.Button(
+            f_btns, text="日時を本体に反映", font=(FONT_FAMILY, 11, "bold"),
+            bg=COLOR_ACCENT, fg="black", relief="flat", padx=20, pady=8,
+            cursor="hand2", command=_apply
+        )
+        btn_save.pack(side=tk.RIGHT, padx=(10, 0))
+
+        tk.Button(
+            f_btns, text="キャンセル", font=(FONT_FAMILY, 11, "bold"),
+            bg="#546E7A", fg="white", relief="flat", padx=15, pady=8,
+            cursor="hand2", command=self.destroy
+        ).pack(side=tk.RIGHT)
+
+        card = tk.Frame(self, bg=COLOR_BG_PANEL, padx=20, pady=20)
+        card.pack(fill=tk.BOTH, expand=True, padx=24, pady=20)
+
+        tk.Label(card, text="■ システム日時の手動設定", font=(FONT_FAMILY, 12, "bold"),
+                 bg=COLOR_BG_PANEL, fg=COLOR_ACCENT).pack(anchor="w", pady=(0, 15))
+
+        self.v_year = tk.IntVar(value=now.year)
+        self.v_month = tk.IntVar(value=now.month)
+        self.v_day = tk.IntVar(value=now.day)
+        self.v_hour = tk.IntVar(value=now.hour)
+        self.v_min = tk.IntVar(value=now.minute)
+        self.v_sec = tk.IntVar(value=now.second)
+
+        # 日付入力行
+        f_date = tk.Frame(card, bg=COLOR_BG_PANEL)
+        f_date.pack(fill=tk.X, pady=8)
+        tk.Label(f_date, text="日付:", font=(FONT_FAMILY, 11, "bold"), bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN, width=8, anchor="w").pack(side=tk.LEFT)
+
+        tk.Spinbox(f_date, from_=2020, to=2099, textvariable=self.v_year, width=6, font=(FONT_FAMILY, 11)).pack(side=tk.LEFT)
+        tk.Label(f_date, text="年", bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN).pack(side=tk.LEFT, padx=(2, 10))
+
+        tk.Spinbox(f_date, from_=1, to=12, textvariable=self.v_month, width=4, font=(FONT_FAMILY, 11)).pack(side=tk.LEFT)
+        tk.Label(f_date, text="月", bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN).pack(side=tk.LEFT, padx=(2, 10))
+
+        tk.Spinbox(f_date, from_=1, to=31, textvariable=self.v_day, width=4, font=(FONT_FAMILY, 11)).pack(side=tk.LEFT)
+        tk.Label(f_date, text="日", bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN).pack(side=tk.LEFT, padx=(2, 0))
+
+        # 時刻入力行
+        f_time = tk.Frame(card, bg=COLOR_BG_PANEL)
+        f_time.pack(fill=tk.X, pady=8)
+        tk.Label(f_time, text="時刻:", font=(FONT_FAMILY, 11, "bold"), bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN, width=8, anchor="w").pack(side=tk.LEFT)
+
+        tk.Spinbox(f_time, from_=0, to=23, textvariable=self.v_hour, width=4, font=(FONT_FAMILY, 11)).pack(side=tk.LEFT)
+        tk.Label(f_time, text="時", bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN).pack(side=tk.LEFT, padx=(2, 10))
+
+        tk.Spinbox(f_time, from_=0, to=59, textvariable=self.v_min, width=4, font=(FONT_FAMILY, 11)).pack(side=tk.LEFT)
+        tk.Label(f_time, text="分", bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN).pack(side=tk.LEFT, padx=(2, 10))
+
+        tk.Spinbox(f_time, from_=0, to=59, textvariable=self.v_sec, width=4, font=(FONT_FAMILY, 11)).pack(side=tk.LEFT)
+        tk.Label(f_time, text="秒", bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN).pack(side=tk.LEFT, padx=(2, 0))
+
+        def _sync_now():
+            n = datetime.now()
+            self.v_year.set(n.year)
+            self.v_month.set(n.month)
+            self.v_day.set(n.day)
+            self.v_hour.set(n.hour)
+            self.v_min.set(n.minute)
+            self.v_sec.set(n.second)
+
+        btn_now = tk.Button(card, text="現在時刻を端末から読み込み", font=(FONT_FAMILY, 10),
+                            bg=COLOR_BG_INPUT, fg=COLOR_TEXT_MAIN, relief="flat", command=_sync_now)
+        btn_now.pack(anchor="w", pady=(15, 0))
+
+
 class SettingsDialog(tk.Toplevel):
     def __init__(self, parent, settings, on_close_callback=None):
         super().__init__(parent)
@@ -389,12 +708,73 @@ class SettingsDialog(tk.Toplevel):
 
         row_idx = tk.Frame(idx_block, bg=COLOR_BG_PANEL)
         row_idx.pack(fill=tk.X)
-        tk.Label(row_idx, text="カメラNo:", font=FONT_SET_LBL,
+        tk.Label(row_idx, text="カメラデバイス:", font=FONT_SET_LBL,
                  bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN, width=10, anchor="w").pack(side=tk.LEFT)
-        sb = self._spinbox(row_idx, self.v_capture_device, 0, 99, 1, width=8,
-                           key_path="camera.capture_device")
-        sb.pack(side=tk.LEFT, padx=(6, 0))
-        Tooltip(sb, "カメラの接続番号（通常は 0 または 1）")
+
+        cur_idx_init = 0
+        try:
+            cur_idx_init = int(self.v_capture_device.get())
+        except ValueError:
+            pass
+        self.detected_devices = [(cur_idx_init, f"[{cur_idx_init}] カメラ (インデックス {cur_idx_init})")]
+        self.v_device_label = tk.StringVar(value=self.detected_devices[0][1])
+
+        def _refresh_detected_cams():
+            btn_rescan.config(state="disabled", text="検索中...")
+
+            def _async_scan():
+                devs = detect_available_cameras()
+
+                def _update_ui():
+                    if not self.winfo_exists():
+                        return
+                    self.detected_devices = devs
+                    labels = [lbl for _, lbl in self.detected_devices]
+                    self.cb_detected_cams["values"] = labels
+
+                    cur_idx = 0
+                    try:
+                        cur_idx = int(self.v_capture_device.get())
+                    except ValueError:
+                        pass
+                    found = False
+                    for idx_val, lbl_val in self.detected_devices:
+                        if idx_val == cur_idx:
+                            self.v_device_label.set(lbl_val)
+                            found = True
+                            break
+                    if not found and labels:
+                        self.v_device_label.set(labels[0])
+                        self.v_capture_device.set(str(self.detected_devices[0][0]))
+
+                    btn_rescan.config(state="normal", text="再検索")
+
+                try:
+                    self.after(0, _update_ui)
+                except Exception:
+                    pass
+
+            threading.Thread(target=_async_scan, daemon=True).start()
+
+        self.cb_detected_cams = ttk.Combobox(row_idx, textvariable=self.v_device_label, state="readonly", width=22, font=FONT_SET_VAL)
+        self.cb_detected_cams.pack(side=tk.LEFT, padx=(6, 4))
+        Tooltip(self.cb_detected_cams, "接続されているUSBカメラをプルダウンで選択します")
+
+        def _on_device_selected(event=None):
+            lbl_sel = self.v_device_label.get()
+            for idx_val, lbl_val in self.detected_devices:
+                if lbl_val == lbl_sel:
+                    self.v_capture_device.set(str(idx_val))
+                    self._mark_changed()
+                    break
+
+        self.cb_detected_cams.bind("<<ComboboxSelected>>", _on_device_selected)
+
+        btn_rescan = tk.Button(row_idx, text="再検索", font=FONT_NORMAL, bg="#546E7A", fg="white", relief="flat", padx=8, command=_refresh_detected_cams)
+        btn_rescan.pack(side=tk.LEFT, padx=2)
+        Tooltip(btn_rescan, "接続されているカメラデバイスを再読み込みします")
+
+        _refresh_detected_cams()
 
         row_prev = tk.Frame(idx_block, bg=COLOR_BG_PANEL)
         row_prev.pack(fill=tk.X, pady=(8, 0))
@@ -863,23 +1243,29 @@ class SettingsDialog(tk.Toplevel):
         import threading as _threading
         _threading.Thread(target=_calc_storage, daemon=True).start()
 
-        # 4. コミット設定（ドアライン対応）
-        outer_cm, inner_cm = create_card(scroll_f, "コミット設定")
-        outer_cm.pack(fill=tk.X, padx=20, pady=10)
+        # 5. システムツール & メンテナンス
+        outer_tools, inner_tools = create_card(scroll_f, "システムツール & メンテナンス")
+        outer_tools.pack(fill=tk.X, padx=20, pady=(10, 20))
 
-        r_hs = tk.Frame(inner_cm, bg=COLOR_BG_PANEL)
-        r_hs.pack(fill=tk.X, pady=6, padx=10)
-        cb_hs = tk.Checkbutton(
-            r_hs, text="コミット番号を 0.5 刻みで進める（ドアライン対応）",
-            variable=self.v_commit_half_step, onvalue=True, offvalue=False,
-            font=FONT_SET_VAL, bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN,
-            activebackground=COLOR_BG_PANEL, activeforeground=COLOR_TEXT_MAIN,
-            selectcolor=COLOR_BG_INPUT, relief="flat",
-            command=self._mark_changed
-        )
-        cb_hs.pack(side=tk.LEFT)
-        Tooltip(cb_hs, "有効にすると、撮影完了ごとにコミット番号が +0.5 ずつ増えます。\n"
-                       "ドアライン撮影など奇数・偶数を区別する運用に使用します。")
+        # 日時設定
+        r_dt = tk.Frame(inner_tools, bg=COLOR_BG_PANEL)
+        r_dt.pack(fill=tk.X, pady=6, padx=10)
+        tk.Label(r_dt, text="ラズパイ本体日時設定:", font=FONT_SET_VAL, bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN, anchor="w", width=22).pack(side=tk.LEFT)
+        btn_dt = tk.Button(r_dt, text="ラズパイ本体の日時を設定", font=FONT_NORMAL, bg=COLOR_ACCENT, fg="black", relief="flat", padx=10, pady=4,
+                           command=lambda: SystemDateTimeDialog(self))
+        btn_dt.pack(side=tk.LEFT)
+        Tooltip(btn_dt, "Linux/Raspberry Piのシステム日時(timedatectl/date)を手動設定します")
+
+        # ショートカット作成
+        r_sh = tk.Frame(inner_tools, bg=COLOR_BG_PANEL)
+        r_sh.pack(fill=tk.X, pady=6, padx=10)
+        tk.Label(r_sh, text="起動スクリプト生成:", font=FONT_SET_VAL, bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN, anchor="w", width=22).pack(side=tk.LEFT)
+        is_win = sys.platform.startswith("win")
+        btn_sh_text = "デスクトップに起動ファイルを作成 (.bat)" if is_win else "デスクトップに起動ファイルを作成 (.sh)"
+        btn_sh = tk.Button(r_sh, text=btn_sh_text, font=FONT_NORMAL, bg=COLOR_ACCENT, fg="black", relief="flat", padx=10, pady=4,
+                           command=lambda: create_desktop_launcher(self))
+        btn_sh.pack(side=tk.LEFT)
+        Tooltip(btn_sh, f"デスクトップに本アプリをワンクリック起動する{'batch (.bat)' if is_win else 'shell (.sh)'}ファイルを作成します")
 
     def browse_folder(self, var):
         folder = filedialog.askdirectory(parent=self, initialdir=var.get())
