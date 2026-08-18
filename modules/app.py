@@ -46,13 +46,17 @@ class ClearViewApp:
         self.camera_lock = threading.Lock()
         self._save_lock = threading.Lock()
         self.trigger_queue = queue.Queue()
+        self.save_queue = queue.Queue()
         self.caps = {}
         self.last_frames = {}
-        self.cap = None  # 旧コード互換用。実際のカメラは self.caps で管理する。
         self.preview_paused = False
         self.inspecting = False
         self.settings_open = False
         self.result_display_until = 0.0
+
+        # 画像保存ワーカースレッドの起動 (8K時の多重スレッド乱立・メモリ枯渇防止)
+        self.save_worker_thread = threading.Thread(target=self._save_worker_loop, daemon=True)
+        self.save_worker_thread.start()
 
         # GPIO デバイス
         self.trig_device = None
@@ -442,6 +446,8 @@ class ClearViewApp:
 
         if confirmed:
             self.running = False
+            if hasattr(self, "save_queue"):
+                self.save_queue.put(None)
             self.logger.info("シャットダウン処理を開始します...")
 
             # GPIO 解放
@@ -532,89 +538,38 @@ class ClearViewApp:
         while self.running:
             fps = int(self.settings.data.get("system", {}).get("preview_fps", PREVIEW_FPS))
             _interval = 1.0 / max(1, fps)
-            if self._preview_cameras():
-                time.sleep(_interval)
-                continue
-            if self.preview_paused or self.inspecting:
-                time.sleep(0.1)
-                continue
-
-            # 結果表示中は静止画表示を維持
-            if time.time() < self.result_display_until:
-                time.sleep(0.1)
-                continue
-
             try:
-                with self.camera_lock:
-                    if self.cap is None or not self.cap.isOpened():
-                        time.sleep(0.5)
-                        continue
-                    grabbed = self.cap.grab()
-                if grabbed:
-                    ret, frame = self.cap.retrieve()
-                else:
-                    ret = False
-
-                if grabbed and ret and frame is not None and frame.size > 0:
-                    self.last_frame = frame
-                    preview_res = self.settings.data.get("camera", {}).get("preview_resolution", "640x480")
-                    if preview_res not in ("プレビューなし", ""):
-                        if not getattr(self.cam_label, "is_updating", False):
-                            self.cam_label.is_updating = True
-
-                            def _upd(f=frame, pr=preview_res):
-                                try:
-                                    pw, ph = map(int, pr.split("x"))
-                                    h, w = f.shape[:2]
-                                    scale = min(pw / w, ph / h)
-                                    nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
-                                    img = cv2.resize(f, (nw, nh), interpolation=cv2.INTER_NEAREST)
-                                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                                    pil_img = Image.fromarray(img)
-                                    # 既存 PhotoImage と寸法が異なる場合は作り直し（左上切り取りバグ防止）
-                                    cur_img = getattr(self.cam_label, "img", None)
-                                    if cur_img is None or cur_img.width() != nw or cur_img.height() != nh:
-                                        self.cam_label.img = ImageTk.PhotoImage(pil_img)
-                                        self.cam_label.config(image=self.cam_label.img)
-                                    else:
-                                        self.cam_label.img.paste(pil_img)
-                                except Exception:
-                                    pass
-                                finally:
-                                    self.cam_label.is_updating = False
-
-                            self.root.after(1, _upd)
-
-                time.sleep(_interval)
+                self._preview_cameras()
             except Exception as e:
                 self.logger.error(f"プレビューエラー: {e}")
-                time.sleep(0.5)
+            time.sleep(_interval)
 
     def _preview_cameras(self):
         """全カメラのフレームを順に取得し、対応するプレビューへ表示する。"""
-        fps = int(self.settings.data.get("system", {}).get("preview_fps", PREVIEW_FPS))
-        _interval = 1.0 / max(1, fps)
         if self.preview_paused or self.inspecting or time.time() < self.result_display_until:
             return True
         for camera in self._camera_configs():
+            if self.preview_paused or self.inspecting:
+                break
             camera_id = camera["id"]
-            cap = self.caps.get(camera_id)
-            if cap is None or not cap.isOpened():
-                continue
-            try:
-                # grab() のみロック内で実行し、retrieve() はロック外で行うことで
-                # ロック保持時間を最短化する
-                with self.camera_lock:
+            ret, frame = False, None
+            # grab() と retrieve() の両方を camera_lock 内で実行し、
+            # 撮影時の release()/reopen による Use-After-Free セグフォを完全防止
+            with self.camera_lock:
+                cap = self.caps.get(camera_id)
+                if cap is None or not cap.isOpened():
+                    continue
+                try:
                     grabbed = cap.grab()
-                if not grabbed:
+                    if grabbed:
+                        ret, frame = cap.retrieve()
+                except Exception as exc:
+                    self.logger.warning(f"プレビュー取得失敗 ({camera_id}): {exc}")
                     continue
-                ret, frame = cap.retrieve()
-                if not ret or frame is None or frame.size == 0:
-                    continue
-                self.last_frames[camera_id] = frame
-                self._show_frame_on_preview(frame, camera)
-            except Exception as exc:
-                self.logger.warning(f"Preview failed for {camera_id}: {exc}")
+
+            if not ret or frame is None or frame.size == 0:
+                continue
+            self._show_frame_on_preview(frame, camera)
         return bool(self.caps)
 
     @staticmethod
@@ -812,28 +767,34 @@ class ClearViewApp:
                 self.inspecting = False
                 time.sleep(0.5)
 
-    def _save_image_async(self, frame, filepath):
-        """画像を非同期で保存（高解像度時のメモリ競合を避けるため直列化）"""
-        frame_copy = frame.copy()
-
-        def _write(f=frame_copy, p=filepath):
+    def _save_worker_loop(self):
+        """非同期画像保存を直列に安全処理する専用ワーカースレッド（メモリ枯渇・セグフォ防止）"""
+        while self.running:
             try:
-                with self._save_lock:
-                    # cv2.imwrite は Windows で日本語パスを正しく扱えないため、
-                    # imencode でメモリにエンコードしてから Python の open() で書き込む
-                    ext = p.suffix.lower()  # 例: ".jpg"
-                    ret, buf = cv2.imencode(ext, f)
-                    if ret:
-                        with open(p, "wb") as fh:
-                            fh.write(buf.tobytes())
-                        self.logger.info(f"保存成功: {p.name}")
-                    else:
-                        self.logger.error(f"保存失敗 (imencode): {p}")
+                task = self.save_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if task is None:
+                break
+            frame, filepath = task
+            try:
+                ext = filepath.suffix.lower()  # 例: ".jpg"
+                ret, buf = cv2.imencode(ext, frame)
+                if ret:
+                    with open(filepath, "wb") as fh:
+                        fh.write(buf.tobytes())
+                    self.logger.info(f"保存成功: {filepath.name}")
+                else:
+                    self.logger.error(f"保存失敗 (imencode): {filepath.name}")
             except Exception as e:
-                self.logger.error(f"保存エラー ({p.name}): {e}")
+                self.logger.error(f"保存エラー ({filepath.name}): {e}")
             finally:
-                del f
-        threading.Thread(target=_write, daemon=True).start()
+                del frame
+                self.save_queue.task_done()
+
+    def _save_image_async(self, frame, filepath):
+        """画像保存キューにタスクを投入（単一ワーカースレッドで順次エンコード・書き込み）"""
+        self.save_queue.put((frame, filepath))
 
     def _show_frame_on_preview(self, frame, camera):
         """撮影フレームをプレビューに表示 (8K等の高解像度はUIスレッド渡し前に縮小)"""
@@ -854,21 +815,23 @@ class ClearViewApp:
             h, w = frame.shape[:2]
             scale = min(pw / w, ph / h)
             nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
-            thumb = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
+            # 8Kプレビュー向けに高速かつ安全なリサイズ
+            thumb = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
             rgb = cv2.cvtColor(thumb, cv2.COLOR_BGR2RGB)
             pil_img = Image.fromarray(rgb)
+            del thumb
         except Exception:
             label.is_updating = False
             return
 
-        def _upd(lbl=label, pil_img=pil_img, nw=nw, nh=nh):
+        def _upd(lbl=label, p_img=pil_img, nw=nw, nh=nh):
             try:
                 cur_img = getattr(lbl, "img", None)
                 if cur_img is None or cur_img.width() != nw or cur_img.height() != nh:
-                    lbl.img = ImageTk.PhotoImage(pil_img)
+                    lbl.img = ImageTk.PhotoImage(p_img)
                     lbl.config(image=lbl.img)
                 else:
-                    lbl.img.paste(pil_img)
+                    lbl.img.paste(p_img)
             except Exception:
                 pass
             finally:

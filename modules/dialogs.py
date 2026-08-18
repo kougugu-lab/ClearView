@@ -323,13 +323,16 @@ class SystemDateTimeDialog(tk.Toplevel):
         f_date.pack(fill=tk.X, pady=8)
         tk.Label(f_date, text="日付:", font=(FONT_FAMILY, 11, "bold"), bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN, width=8, anchor="w").pack(side=tk.LEFT)
 
-        tk.Spinbox(f_date, from_=2020, to=2099, textvariable=self.v_year, width=6, font=(FONT_FAMILY, 11)).pack(side=tk.LEFT)
+        sp_y = tk.Spinbox(f_date, from_=2020, to=2099, textvariable=self.v_year, width=6, font=(FONT_FAMILY, 11), repeatdelay=0, repeatinterval=0)
+        sp_y.pack(side=tk.LEFT)
         tk.Label(f_date, text="年", bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN).pack(side=tk.LEFT, padx=(2, 10))
 
-        tk.Spinbox(f_date, from_=1, to=12, textvariable=self.v_month, width=4, font=(FONT_FAMILY, 11)).pack(side=tk.LEFT)
+        sp_m = tk.Spinbox(f_date, from_=1, to=12, textvariable=self.v_month, width=4, font=(FONT_FAMILY, 11), repeatdelay=0, repeatinterval=0)
+        sp_m.pack(side=tk.LEFT)
         tk.Label(f_date, text="月", bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN).pack(side=tk.LEFT, padx=(2, 10))
 
-        tk.Spinbox(f_date, from_=1, to=31, textvariable=self.v_day, width=4, font=(FONT_FAMILY, 11)).pack(side=tk.LEFT)
+        sp_d = tk.Spinbox(f_date, from_=1, to=31, textvariable=self.v_day, width=4, font=(FONT_FAMILY, 11), repeatdelay=0, repeatinterval=0)
+        sp_d.pack(side=tk.LEFT)
         tk.Label(f_date, text="日", bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN).pack(side=tk.LEFT, padx=(2, 0))
 
         # 時刻入力行
@@ -337,14 +340,28 @@ class SystemDateTimeDialog(tk.Toplevel):
         f_time.pack(fill=tk.X, pady=8)
         tk.Label(f_time, text="時刻:", font=(FONT_FAMILY, 11, "bold"), bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN, width=8, anchor="w").pack(side=tk.LEFT)
 
-        tk.Spinbox(f_time, from_=0, to=23, textvariable=self.v_hour, width=4, font=(FONT_FAMILY, 11)).pack(side=tk.LEFT)
+        sp_h = tk.Spinbox(f_time, from_=0, to=23, textvariable=self.v_hour, width=4, font=(FONT_FAMILY, 11), repeatdelay=0, repeatinterval=0)
+        sp_h.pack(side=tk.LEFT)
         tk.Label(f_time, text="時", bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN).pack(side=tk.LEFT, padx=(2, 10))
 
-        tk.Spinbox(f_time, from_=0, to=59, textvariable=self.v_min, width=4, font=(FONT_FAMILY, 11)).pack(side=tk.LEFT)
+        sp_mi = tk.Spinbox(f_time, from_=0, to=59, textvariable=self.v_min, width=4, font=(FONT_FAMILY, 11), repeatdelay=0, repeatinterval=0)
+        sp_mi.pack(side=tk.LEFT)
         tk.Label(f_time, text="分", bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN).pack(side=tk.LEFT, padx=(2, 10))
 
-        tk.Spinbox(f_time, from_=0, to=59, textvariable=self.v_sec, width=4, font=(FONT_FAMILY, 11)).pack(side=tk.LEFT)
+        sp_s = tk.Spinbox(f_time, from_=0, to=59, textvariable=self.v_sec, width=4, font=(FONT_FAMILY, 11), repeatdelay=0, repeatinterval=0)
+        sp_s.pack(side=tk.LEFT)
         tk.Label(f_time, text="秒", bg=COLOR_BG_PANEL, fg=COLOR_TEXT_MAIN).pack(side=tk.LEFT, padx=(2, 0))
+
+        for sp in [sp_y, sp_m, sp_d, sp_h, sp_mi, sp_s]:
+            def _stop_sp(event=None, widget=sp):
+                try:
+                    rep = widget.tk.call('set', '::tk::spinbox::Repeater')
+                    if rep: widget.tk.call('after', 'cancel', rep)
+                except Exception:
+                    pass
+            sp.bind("<ButtonRelease-1>", _stop_sp, add="+")
+            sp.bind("<Leave>", _stop_sp, add="+")
+            sp.bind("<FocusOut>", _stop_sp, add="+")
 
         def _sync_now():
             n = datetime.now()
@@ -566,7 +583,21 @@ class SettingsDialog(tk.Toplevel):
     def _spinbox(self, parent, var, from_, to, increment=1, width=6, key_path=None):
         sb = tk.Spinbox(parent, from_=from_, to=to, increment=increment, textvariable=var,
                         font=FONT_SET_VAL, width=width, bg=COLOR_BG_INPUT, fg="white",
-                        buttonbackground="#78909C", bd=1, relief="solid")
+                        buttonbackground="#78909C", bd=1, relief="solid",
+                        repeatdelay=0, repeatinterval=0)
+        
+        # ラズパイ環境での長押しタイマー暴走を防止する安全ハンドラ
+        def _stop_repeat(event=None):
+            try:
+                rep_id = sb.tk.call('set', '::tk::spinbox::Repeater')
+                if rep_id:
+                    sb.tk.call('after', 'cancel', rep_id)
+            except Exception:
+                pass
+        sb.bind("<ButtonRelease-1>", _stop_repeat, add="+")
+        sb.bind("<Leave>", _stop_repeat, add="+")
+        sb.bind("<FocusOut>", _stop_repeat, add="+")
+
         if key_path:
             def _trace(*args):
                 self._mark_changed()
