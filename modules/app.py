@@ -207,12 +207,17 @@ class ClearViewApp:
 
         res_str = target_res_str or camera.get("preview_resolution", "640x480")
         parsed = self._parse_resolution(res_str)
+
+        # 先に MJPG をセットして帯域制限・非圧縮YUYVによる8K拒否を回避
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
         if parsed:
             cw, ch = parsed
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, cw)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, ch)
 
-        # 解像度設定直後に再度 MJPG フォーマットを強制（V4L2で解像度セット時にYUYVへリセットされ、USB2.0で帯域オーバーになるのを防止）
+        # 解像度設定直後にも再度 MJPG フォーマットを強制（V4L2リセット防止）
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
@@ -840,11 +845,15 @@ class ClearViewApp:
 
     def _pulse_gpio(self, device, duration):
         """GPIO出力を指定時間パルスする (別スレッド)"""
-        def _do():
+        if device is None:
+            return
+        def _do(dev=device):
             try:
-                device.on()
-                time.sleep(max(0.05, float(duration)))
-                device.off()
+                if dev and hasattr(dev, "on"):
+                    dev.on()
+                    time.sleep(max(0.05, float(duration)))
+                    if hasattr(dev, "off"):
+                        dev.off()
             except Exception as e:
                 self.logger.error(f"GPIO出力エラー: {e}")
         threading.Thread(target=_do, daemon=True).start()
@@ -972,9 +981,14 @@ class ClearViewApp:
             messagebox.showerror("エラー", f"フォルダを開けませんでした:\n{folder}", parent=self.root)
 
     def open_settings(self):
+        if getattr(self, "inspecting", False):
+            self.logger.warning("撮影処理中のため設定画面を開けません。完了後に再度お試しください。")
+            messagebox.showwarning("撮影中", "撮影処理中のため設定画面を開けません。\n撮影完了後に再度開いてください。", parent=self.root)
+            return
+
         self.settings_open = True
         self.preview_paused = True
-        
+
         # 安全のため、設定画面表示前にアプリ本体のカメラおよびGPIOを一旦解放する
         with self.camera_lock:
             self._release_cameras()
@@ -982,7 +996,10 @@ class ClearViewApp:
         try:
             for dev in [self.trig_device, self.out_ok, self.out_ng, self.out_running]:
                 if dev:
-                    dev.close()
+                    try:
+                        dev.close()
+                    except Exception:
+                        pass
             self.trig_device = None
             self.out_ok = None
             self.out_ng = None

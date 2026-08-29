@@ -43,13 +43,14 @@ def _to_raw(s):
 
 NON_CAMERA_KEYWORDS = (
     "bcm2835-codec", "bcm2835-isp", "rpivid", "pisp", "m2m",
-    "codec", "decode", "encode", "isp", "video-codec", "vc4", "h264", "hevc"
+    "codec", "decode", "encode", "isp", "video-codec", "vc4", "h264", "hevc",
+    "metadata", "meta"
 )
 
 def detect_available_cameras():
     """OSが認識しているカメラデバイスを自動探索し、
     [(index_int, display_label_str), ...] のリストを返す
-    （Raspberry Piの動画デコーダ/ISPノード等は除外）
+    （Raspberry Piの動画デコーダ/ISP/メタデータノード等は除外）
     """
     import subprocess
     devices = []
@@ -61,6 +62,17 @@ def detect_available_cameras():
                 if entry.startswith("video"):
                     try:
                         idx = int(entry.replace("video", ""))
+
+                        # 補助ノード（index が 0 以外はメタデータ等）の除外チェック
+                        idx_file = os.path.join(v4l_dir, entry, "index")
+                        if os.path.exists(idx_file):
+                            try:
+                                with open(idx_file, "r", encoding="utf-8") as f:
+                                    if f.read().strip() != "0":
+                                        continue
+                            except Exception:
+                                pass
+
                         name_file = os.path.join(v4l_dir, entry, "name")
                         cam_name = f"カメラ {idx}"
                         if os.path.exists(name_file):
@@ -69,16 +81,19 @@ def detect_available_cameras():
                                 if name_text:
                                     cam_name = name_text
 
-                        # Raspberry Piの動画デコーダ・ISP・M2Mノードはキャプチャ不可のため事前スキップ
+                        # Raspberry Piの動画デコーダ・ISP・M2M・メタデータノードはキャプチャ不可のため事前スキップ
                         cam_name_lower = cam_name.lower()
                         if any(kw in cam_name_lower for kw in NON_CAMERA_KEYWORDS):
                             continue
 
                         cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
                         if cap and cap.isOpened():
-                            ret, _ = cap.read()
-                            if ret:
-                                devices.append((idx, f"[{idx}] {cam_name}"))
+                            # 軽量解像度 + MJPG に設定して安全・高速に確認（未設定readによるselectタイムアウト防止）
+                            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+                            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                            devices.append((idx, f"[{idx}] {cam_name}"))
                             cap.release()
                     except Exception:
                         pass
