@@ -2,6 +2,25 @@
 
 ---
 
+## [2026-09-07] v1.4.4 - inspection_app 準拠 4K常時オープン維持（No Re-open）による Segmentation Fault 根治 & 8K切替シーケンス強化 & コード品質改善
+
+### 修正 (Fixed)
+- **4K 撮影時における Segmentation Fault を根本解決（inspection_app 準拠の常時オープン方式への移行）** (`app.py`)
+  - **真因の解明**: `inspection_app` では最初から 4K（本撮影解像度）でカメラをオープンして生涯 `release()` しないため安定していたのに対し、ClearView では起動時にプレビュー解像度 (720p/480p) でオープンし、トリガーが入るたびに `release()` → 4K 再オープン → 撮影 → `release()` → 720p 再オープンを毎回繰り返していました。この短時間の頻繁なオープン/クローズにより、Linux/V4L2 (uvcvideo) ドライバ内部でバッファ破棄と Isochronous 転送の再ネゴシエーションが追いつかず、カーネルおよび C++ コアで Segmentation Fault を引き起こしていました。
+  - **常時オープン維持 (No Re-open) の導入**: 4K 以下のストリーミング解像度では、起動時に最初から本撮影解像度（4K等）でオープンし、撮影時のカメラ切り替え・再オープンを完全に撤廃。プレビューは取得した 4K フレームを画面サイズに縮小描画するだけに改善。これにより、4K 撮影時でのカメラ破棄・再生成がゼロになり、`inspection_app` と完全に同等の安定性を実現しました。
+- **8K (48MP) 解像度切替時の V4L2 バッファ解放待機とクリーンアップ強化** (`app.py`)
+  - ストリーミングが 4K までしかできないカメラで 8K 撮影を行う場合、プレビュー停止待機 (`0.1s`)、`old_cap.release()` 後の OS/V4L2 カーネルバッファ解放待機 (`0.35s`)、明示的な `gc.collect()` を挟むことで、ドライバ内部のクラッシュやタイムアウトを確実に防止する完全安全シーケンスを実装。
+- **`camera_lock` 保持中の `time.sleep()` によるプレビュースレッドブロックを解消** (`app.py`)
+  - 8K 切替時の `cap.release()` → `time.sleep(0.35)` → `gc.collect()` → 再オープン のシーケンスが `with camera_lock:` の中で一括実行されており、sleep 中もロックを保持し続けプレビュースレッドを最大 350ms ブロックしていた問題を修正。`release()` をロック内、`sleep` と `gc.collect()` および再オープンをロック外に分離し、プレビューへの影響を最小化。
+- **`_release_cameras()` での `caps_opened_res` クリア漏れを修正** (`app.py`)
+  - `_release_cameras()` で `self.caps = {}` のみをクリアしており `self.caps_opened_res` が古い情報を保持したままになっていた問題を修正。設定画面クローズ後の `setup_hardware()` 再初期化時に旧解像度情報が残留して `_capture_all_cameras()` での解像度比較が誤判定するケースを根絶。
+- **`_read_camera_frame()` の `grab()` / `retrieve()` 分割ロックを統合** (`app.py`)
+  - `grab()` と `retrieve()` がそれぞれ別の `with camera_lock:` ブロックに分かれており、その間に別スレッドが割り込める隙間があった問題を修正。両操作を単一の `camera_lock` ブロック内に統合し、`inspection_app` 準拠の安全な排他制御を実現。
+- **`setup_hardware()` 内のデッドコード（旧 `self.cap` 方式）を削除** (`app.py`)
+  - `return` 文の後に残っていた旧単体カメラ実装のデッドコード（`cam_cfg`、`self.cap = cap` など）を完全削除。`self.caps` 辞書管理方式に完全一本化し、コードの可読性と保守性を向上。
+
+---
+
 ## [2026-08-24] v1.4.3 - 撮影中設定画面オープン競合防止・V4L2 メタデータ除外・GPIO NoneType エラー防止
 
 ### 修正 (Fixed)

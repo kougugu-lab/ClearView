@@ -48,6 +48,7 @@ class ClearViewApp:
         self.trigger_queue = queue.Queue()
         self.save_queue = queue.Queue()
         self.caps = {}
+        self.caps_opened_res = {}
         self.last_frames = {}
         self.preview_paused = False
         self.inspecting = False
@@ -139,33 +140,6 @@ class ClearViewApp:
 
             for camera in cameras:
                 self._open_camera(camera)
-            return
-
-            # カメラオープン
-            # Linux(Raspberry Pi) = CAP_V4L2 / Windows = CAP_DSHOW(MSMF回避) / その他 = CAP_ANY
-            device_idx = int(cam_cfg.get("capture_device", 0))
-            preview_res = cam_cfg.get("preview_resolution", "640x480")
-            if sys.platform.startswith("linux"):
-                backend = cv2.CAP_V4L2
-            elif sys.platform.startswith("win"):
-                backend = cv2.CAP_DSHOW
-            else:
-                backend = cv2.CAP_ANY
-            cap = cv2.VideoCapture(device_idx, backend)
-            if cap.isOpened():
-                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                if preview_res not in ("プレビューなし", "") and "x" in preview_res:
-                    pw, ph = map(int, preview_res.split("x"))
-                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, pw)
-                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, ph)
-                # カメラプロパティ適用 (値が -1 の場合はスキップ＝カメラデフォルト)
-                self._apply_camera_props(cap, cam_cfg.get("camera_props", {}))
-                self.cap = cap
-                self.logger.info(f"カメラ (インデックス {device_idx}, backend={backend}) を初期化しました。")
-            else:
-                self.cap = None
-                self.logger.warning(f"カメラ (インデックス {device_idx}) をオープンできませんでした。")
         except Exception as e:
             self.logger.error(f"ハードウェア初期化エラー: {e}")
         finally:
@@ -179,6 +153,7 @@ class ClearViewApp:
             except Exception:
                 pass
         self.caps = {}
+        self.caps_opened_res = {}
 
     def _camera_configs(self):
         """設定済みカメラの一覧を返す。設定未作成時も安全に空配列を返す。"""
@@ -225,11 +200,25 @@ class ClearViewApp:
         return cap
 
     def _open_camera(self, camera):
-        """待機・プレビュー用解像度でカメラを初期オープンする。"""
-        cap = self._open_camera_device(camera)
+        """カメラを初期オープンする。
+        本撮影解像度が4K以下のストリーミング可能な解像度の場合は、
+        inspection_app と同様に最初から本撮影解像度でオープンして再オープン（セグフォ要因）をゼロにする。
+        8K (48MP) などストリーミング非対応の巨大解像度の場合のみプレビュー解像度で開く。
+        """
+        capt_res = camera.get("capture_resolution", "1920x1080").split(" ")[0]
+        parsed = self._parse_resolution(capt_res)
+        is_huge_8k = False
+        if parsed:
+            w, h = parsed
+            if w * h >= 7680 * 4320:  # 8K以上
+                is_huge_8k = True
+
+        init_res = camera.get("preview_resolution", "1280x720").split(" ")[0] if is_huge_8k else capt_res
+        cap = self._open_camera_device(camera, init_res)
         if cap:
             self.caps[camera["id"]] = cap
-            self.logger.info(f"カメラ '{camera.get('name', camera['id'])}' を初期化しました（インデックス: {camera.get('capture_device', 0)}）。")
+            self.caps_opened_res[camera["id"]] = init_res
+            self.logger.info(f"カメラ '{camera.get('name', camera['id'])}' を初期化しました（インデックス: {camera.get('capture_device', 0)}, 解像度: {init_res}）。")
 
     def _on_trigger(self):
         """GPIOトリガー受信時のコールバック"""
@@ -602,7 +591,9 @@ class ClearViewApp:
         return 0.3
 
     def _read_camera_frame(self, cap, width=0, height=0):
-        """grab/retrieve をリトライ付きで実行（高解像度向け）"""
+        """grab/retrieve をリトライ付きで実行（高解像度向け）。
+        grab() と retrieve() を同一の camera_lock 内で実行し、
+        inspection_app 準拠の安全な排他制御を実現する。"""
         if not cap or not cap.isOpened():
             return False, None
         pixels = width * height if width and height else 0
@@ -615,13 +606,12 @@ class ClearViewApp:
         for _ in range(retries):
             with self.camera_lock:
                 grabbed = cap.grab()
-            if not grabbed:
-                time.sleep(retry_delay)
-                continue
-            with self.camera_lock:
-                ret, frame = cap.retrieve()
-            if ret and frame is not None and frame.size > 0:
-                return True, frame.copy()
+                if not grabbed:
+                    pass
+                else:
+                    ret, frame = cap.retrieve()
+                    if ret and frame is not None and frame.size > 0:
+                        return True, frame.copy()
             time.sleep(retry_delay)
         return False, None
 
@@ -641,37 +631,44 @@ class ClearViewApp:
 
         reopened_caps = {}
         try:
-            # 各カメラについて、preview_resolution と capture_resolution が異なるか判定
-            with self.camera_lock:
-                for camera in cameras:
-                    cid = camera["id"]
-                    prev_res = camera.get("preview_resolution", "640x480").split(" ")[0]
-                    capt_res = camera.get("capture_resolution", "1920x1080").split(" ")[0]
+            # プレビュースレッドが完全に停止するのを確実に待機
+            time.sleep(0.1)
 
-                    # プレビューと撮影で解像度が異なる場合、安全に release() して 8K (capt_res) で再オープン
-                    if prev_res != capt_res and "x" in capt_res:
+            # 各カメラについて、現在開いている解像度と本撮影解像度が異なる場合のみ再オープン
+            # (4K以下の場合は最初から本撮影解像度で開かれているため再オープンはゼロ回＝セグフォゼロ)
+            for camera in cameras:
+                cid = camera["id"]
+                capt_res = camera.get("capture_resolution", "1920x1080").split(" ")[0]
+                cur_res = getattr(self, "caps_opened_res", {}).get(cid, "").split(" ")[0]
+
+                # 現在の解像度と本撮影解像度が異なり、かつ 8K など再オープンが必要な場合のみ切り替え
+                if cur_res and capt_res and cur_res != capt_res and "x" in capt_res:
+                    with self.camera_lock:
                         old_cap = self.caps.get(cid)
                         if old_cap and old_cap.isOpened():
                             old_cap.release()
-                        self.logger.info(f"【カメラ再オープン】'{cid}' 本撮影用解像度に切り替え: {prev_res} -> {capt_res}")
-                        new_cap = self._open_camera_device(camera, capt_res)
-                        if new_cap:
-                            self.caps[cid] = new_cap
-                            reopened_caps[cid] = prev_res
+                        del old_cap
+                    # ロック外で OS・V4L2カーネルバッファの完全解放を待機（セグフォ・timeout防止）
+                    time.sleep(0.35)
+                    import gc
+                    gc.collect()
 
-            # バッファのフラッシュと解像度安定化待機
-            max_settle = 0.5
+                    self.logger.info(f"【カメラ再オープン】'{cid}' 本撮影用解像度に切り替え: {cur_res} -> {capt_res}")
+                    new_cap = self._open_camera_device(camera, capt_res)
+                    if new_cap:
+                        with self.camera_lock:
+                            self.caps[cid] = new_cap
+                        self.caps_opened_res[cid] = capt_res
+                        reopened_caps[cid] = cur_res
+
+            # 初回ショット前に古いバッファをクリア (inspection_app 準拠)
             with self.camera_lock:
                 for camera in cameras:
                     cap = self.caps.get(camera["id"])
                     if cap and cap.isOpened():
-                        parsed = self._parse_resolution(camera.get("capture_resolution", "1920x1080"))
-                        if parsed:
-                            w, h = parsed
-                            max_settle = max(max_settle, self._capture_settle_seconds(w, h))
                         for _ in range(2):
                             cap.grab()
-            time.sleep(max_settle)
+            time.sleep(0.1)
 
             # 指定枚数の連続撮影
             for shot_idx in range(capture_count):
@@ -696,20 +693,28 @@ class ClearViewApp:
             self.logger.error(f"マルチカメラ撮影エラー: {exc}")
             errors.append(str(exc))
         finally:
-            # 8Kで再オープンしていたカメラをクローズし、元のプレビュー解像度で再オープン
+            # 8K撮影等で再オープンしていたカメラのみ元のプレビュー解像度に安全復帰
             if reopened_caps:
-                with self.camera_lock:
-                    for camera in cameras:
-                        cid = camera["id"]
-                        if cid in reopened_caps:
-                            prev_res = reopened_caps[cid]
+                for camera in cameras:
+                    cid = camera["id"]
+                    if cid in reopened_caps:
+                        prev_res = reopened_caps[cid]
+                        with self.camera_lock:
                             capt_cap = self.caps.get(cid)
                             if capt_cap and capt_cap.isOpened():
                                 capt_cap.release()
-                            self.logger.info(f"【カメラ復帰】'{cid}' プレビュー用解像度に再オープン復帰: {prev_res}")
-                            prev_cap = self._open_camera_device(camera, prev_res)
-                            if prev_cap:
+                            del capt_cap
+                        # ロック外で OS・V4L2カーネルバッファの完全解放を待機
+                        time.sleep(0.35)
+                        import gc
+                        gc.collect()
+
+                        self.logger.info(f"【カメラ復帰】'{cid}' プレビュー用解像度に再オープン復帰: {prev_res}")
+                        prev_cap = self._open_camera_device(camera, prev_res)
+                        if prev_cap:
+                            with self.camera_lock:
                                 self.caps[cid] = prev_cap
+                            self.caps_opened_res[cid] = prev_res
             self.preview_paused = prev_paused  # プレビュー再開
 
         expected = len(cameras) * capture_count
