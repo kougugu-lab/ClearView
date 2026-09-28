@@ -100,32 +100,41 @@ class MockInput(MockDevice):
         return self._value
 
 
-try:
-    from gpiozero import DigitalInputDevice as _DigitalInputDevice
-    from gpiozero import OutputDevice as _OutputDevice
-    GPIO_AVAILABLE = True
+import sys
 
-    def DigitalInputDevice(pin, *args, **kwargs):
-        global GPIO_AVAILABLE
-        try:
-            return _DigitalInputDevice(pin, *args, **kwargs)
-        except Exception:
-            # 物理ピンにアクセスできない場合はモックにフォールバック
-            GPIO_AVAILABLE = False
-            return MockInput(pin, *args, **kwargs)
-
-    def OutputDevice(pin, *args, **kwargs):
-        global GPIO_AVAILABLE
-        try:
-            return _OutputDevice(pin, *args, **kwargs)
-        except Exception:
-            GPIO_AVAILABLE = False
-            return MockDevice(pin, *args, **kwargs)
-
-except ImportError:
+# Windows / macOS / 非Linux 環境では Raspberry Pi の実機 GPIO は存在しないため、
+# 不要な PinFactory 探索や警告ログを完全にスキップして即座にモックを使用する (GPIO_AVAILABLE = False)
+if not sys.platform.startswith("linux"):
     GPIO_AVAILABLE = False
     DigitalInputDevice = MockInput
     OutputDevice = MockDevice
+else:
+    try:
+        from gpiozero import DigitalInputDevice as _DigitalInputDevice
+        from gpiozero import OutputDevice as _OutputDevice
+        GPIO_AVAILABLE = True
+
+        def DigitalInputDevice(pin, *args, **kwargs):
+            global GPIO_AVAILABLE
+            try:
+                return _DigitalInputDevice(pin, *args, **kwargs)
+            except Exception:
+                # 物理ピンにアクセスできない場合はモックにフォールバック
+                GPIO_AVAILABLE = False
+                return MockInput(pin, *args, **kwargs)
+
+        def OutputDevice(pin, *args, **kwargs):
+            global GPIO_AVAILABLE
+            try:
+                return _OutputDevice(pin, *args, **kwargs)
+            except Exception:
+                GPIO_AVAILABLE = False
+                return MockDevice(pin, *args, **kwargs)
+
+    except ImportError:
+        GPIO_AVAILABLE = False
+        DigitalInputDevice = MockInput
+        OutputDevice = MockDevice
 
 
 def is_gpio_available():

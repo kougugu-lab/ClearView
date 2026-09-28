@@ -138,6 +138,32 @@ class ClearViewApp:
             self.out_running = OutputDevice(gpio.get("system_running_pin", 5))
             self.out_running.on()
 
+            # Linux環境のカメラ by_path 自動マイグレーション（未設定の場合に物理USBポートを自動記憶）
+            if sys.platform.startswith("linux"):
+                by_path_dir = "/dev/v4l/by-path"
+                if os.path.exists(by_path_dir):
+                    by_path_map = {}
+                    try:
+                        for fname in sorted(os.listdir(by_path_dir)):
+                            full_p = os.path.join(by_path_dir, fname)
+                            real_p = os.path.realpath(full_p)
+                            if "index0" in fname or real_p not in by_path_map:
+                                by_path_map[real_p] = full_p
+                    except Exception:
+                        pass
+                    
+                    migrated = False
+                    for c in cameras:
+                        if not c.get("by_path"):
+                            c_idx = c.get("capture_device", 0)
+                            dev_node = f"/dev/video{c_idx}"
+                            if dev_node in by_path_map:
+                                c["by_path"] = by_path_map[dev_node]
+                                migrated = True
+                                self.logger.info(f"カメラ '{c.get('name')}' の物理USBポート(by_path)を自動登録しました: {c['by_path']}")
+                    if migrated:
+                        self.settings.save()
+
             for camera in cameras:
                 self._open_camera(camera)
         except Exception as e:
@@ -169,6 +195,30 @@ class ClearViewApp:
         """指定された解像度で VideoCapture をオープンしプロパティを適用する。"""
         camera_id = camera["id"]
         device_idx = int(camera.get("capture_device", 0))
+
+        # Linux (Raspberry Pi OS等) 環境で by_path が設定されている場合は動的に実ノードを解決
+        by_path = camera.get("by_path")
+        if sys.platform.startswith("linux") and by_path:
+            if os.path.exists(by_path):
+                try:
+                    real_p = os.path.realpath(by_path)
+                    bname = os.path.basename(real_p)
+                    if bname.startswith("video") and bname[5:].isdigit():
+                        resolved_idx = int(bname[5:])
+                        if resolved_idx != device_idx:
+                            self.logger.info(
+                                f"カメラ '{camera.get('name', camera_id)}' のインデックスを物理ポートから動的解決: "
+                                f"{device_idx} -> {resolved_idx} ({by_path})"
+                            )
+                        device_idx = resolved_idx
+                except Exception as e:
+                    self.logger.warning(f"by_path解決エラー: {e}")
+            else:
+                self.logger.warning(
+                    f"カメラ '{camera.get('name', camera_id)}' の物理ポートが見つかりません: {by_path} "
+                    f"(インデックス {device_idx} でフォールバック試行)"
+                )
+
         if sys.platform.startswith("linux"):
             backend = cv2.CAP_V4L2
         elif sys.platform.startswith("win"):
